@@ -1,0 +1,298 @@
+\documentclass[conference, twocolumn]{IEEEtran}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{cite}
+\usepackage{balance}
+
+\definecolor{riskon}{HTML}{22C993}
+\definecolor{defensive}{HTML}{3B82F6}
+\definecolor{transitional}{HTML}{E8A838}
+\definecolor{crisis}{HTML}{E84040}
+
+\begin{document}
+
+\title{Self-Supervised Market Regime Detection for Risk-Aware Portfolio Control Using Temporal Convolutional Networks and Hidden Markov Models}
+
+\author{\IEEEauthorblockN{Pratham Gupta}
+\IEEEauthorblockA{Department of Computer Science\\
+\textit{pratham.gupta@example.com}}}
+
+\maketitle
+
+% === ABSTRACT ===
+\begin{abstract}
+Accurate identification of market regimes---such as risk-on rallies, defensive consolidations, and crisis drawdowns---is critical for institutional portfolio management, yet remains challenging due to the non-stationary, noisy, and high-dimensional nature of financial time series. We propose \textbf{RegimeEngine}, a two-stage self-supervised framework that combines a Temporal Convolutional Network (TCN) encoder trained with a margin-based contrastive loss and a Gaussian Hidden Markov Model (HMM) for unsupervised regime discovery. In Stage~1, the TCN ingests 21-day sliding windows of multi-asset features---log returns, 21-day realized volatility, CUSUM structural break statistics, 63-day Shannon entropy, and cross-asset rolling correlations---and compresses them into a compact 8-dimensional latent representation via contrastive learning on temporally adjacent positive pairs and batch-rolled negative pairs. In Stage~2, a Gaussian HMM with diagonal covariance, minimum covariance floor, and 10 EM restarts is fitted on the StandardScaler-normalized latent embeddings to identify four semantically ordered regimes: Risk-On, Defensive, Transitional, and Crisis, mapped by ascending realized volatility. The detected regimes drive a strategy multiplexer that selects among Mean-Variance Optimization (MVO), Minimum Expected Shortfall, Hierarchical Risk Parity (HRP), and equal-weight allocation. A rigorous ablation study across five unsupervised metrics---Silhouette Score, Calinski-Harabasz Index, Davies-Bouldin Index, Regime Stability, and Predictive Validity---demonstrates that TCN+HMM achieves superior cluster separation, regime persistence, and forward-looking economic significance compared to baselines on raw returns, engineered features, and PCA-reduced representations. Experiments on SPY, TLT, and GLD daily data from 2015--2024 validate the framework.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Market regime detection, self-supervised learning, temporal convolutional networks, hidden Markov models, portfolio optimization, contrastive learning, risk management
+\end{IEEEkeywords}
+
+% === 1. INTRODUCTION ===
+\section{Introduction}
+\label{sec:intro}
+
+Financial markets are inherently non-stationary systems that alternate between qualitatively distinct behavioral regimes~\cite{hamilton1989}. During \textit{risk-on} phases, equity markets exhibit low volatility, positive serial correlation, and suppressed cross-asset co-movement. In \textit{crisis} periods, volatility spikes, return distributions develop heavy left tails, and correlations among risky assets converge toward unity---a phenomenon termed \textit{correlation breakdown}~\cite{longin2001}. The intermediate regimes---defensive consolidation and transitional uncertainty---present their own statistical fingerprints.
+
+Correctly detecting these regime transitions in real-time is of paramount importance for several financial applications: (i)~dynamic asset allocation, where portfolio weights must adapt to changes in the risk environment~\cite{nystrup2017}; (ii)~risk budgeting, where Value-at-Risk and Expected Shortfall estimates must reflect the current regime~\cite{rockafellar2000}; and (iii)~systematic trading, where signal generation depends on whether the market is trending or mean-reverting.
+
+\subsection{Limitations of Existing Approaches}
+
+Traditional regime detection suffers from three fundamental limitations:
+
+\textbf{L1: Noise sensitivity.} Fitting HMMs directly on raw log returns yields unstable, rapidly switching regimes (mean duration $<$5 days) because daily returns have inherently low signal-to-noise ratios~\cite{bulla2006}. The resulting regimes flicker too rapidly to be actionable for portfolio rebalancing.
+
+\textbf{L2: Feature engineering bottleneck.} Hand-crafted features (volatility, correlation, momentum) improve regime quality but require domain expertise and may miss non-linear interactions. The feature space grows combinatorially with the number of assets and lookback windows.
+
+\textbf{L3: Linear compression.} Classical dimensionality reduction via PCA preserves only linear variance structure, discarding non-linear manifold geometry that may be critical for distinguishing regime boundaries in the feature space.
+
+\subsection{Proposed Solution}
+
+We address these limitations by introducing \textbf{RegimeEngine}, an end-to-end, self-supervised framework consisting of six stages:
+
+\begin{enumerate}
+    \item \textbf{Data Ingestion} from the yfinance API for multi-asset ETF prices.
+    \item \textbf{Feature Engineering} producing log returns, realized volatility, CUSUM structural breaks, Shannon entropy, and cross-asset correlations.
+    \item \textbf{Self-Supervised Representation Learning} via a TCN encoder trained with contrastive loss on temporally adjacent windows.
+    \item \textbf{Gaussian HMM Regime Detection} on the learned 8D latent space with robust multi-restart estimation.
+    \item \textbf{Regime-Conditional Portfolio Allocation} using a strategy multiplexer (MVO, Min-ES, HRP, Equal Weight).
+    \item \textbf{Backtesting and Risk Analytics} with an interactive Streamlit dashboard.
+\end{enumerate}
+
+\subsection{Contributions}
+
+Our specific contributions are:
+\begin{itemize}
+    \item A \textbf{contrastive TCN encoder architecture} (3 temporal blocks, channels [16,32,64], 8D latent space) that learns regime-discriminative representations without any labels.
+    \item A \textbf{robust HMM estimation pipeline} with StandardScaler normalization, diagonal covariance, minimum covariance floor ($10^{-3}$), and 10 EM restarts.
+    \item A \textbf{volatility-ordered semantic mapping} that assigns interpretable regime names (Risk-On, Defensive, Transitional, Crisis) by sorting HMM states by observed return volatility.
+    \item A \textbf{comprehensive ablation study} with five unsupervised metrics that quantitatively demonstrates the superiority of TCN-learned representations.
+    \item An \textbf{open-source interactive dashboard} (RegimeEngine) deployed via Streamlit with 7 analysis tabs.
+\end{itemize}
+
+The remainder of this paper is organized as follows. Section~\ref{sec:related} reviews related work. Section~\ref{sec:method} details the proposed method. Section~\ref{sec:experiments} presents experimental results. Section~\ref{sec:ablation} provides the ablation and comparative study. Section~\ref{sec:conclusion} concludes.
+
+% === 2. RELATED WORKS ===
+\section{Related Works}
+\label{sec:related}
+
+\subsection{Hidden Markov Models for Regime Detection}
+
+Hamilton~\cite{hamilton1989} introduced the Markov-switching autoregressive model for business cycles, establishing the foundational framework for regime detection. The model assumes that observed economic data is generated by a latent discrete-state Markov chain where each state has distinct distributional parameters. Ang and Bekaert~\cite{ang2002} extended this to international equity markets, showing time-varying correlations across regimes. Bulla and Bulla~\cite{bulla2006} applied Gaussian HMMs to daily returns of DAX and S\&P 500, identifying two to four persistent regimes with economically meaningful volatility differentials.
+
+Nystrup et al.~\cite{nystrup2017} advanced the field with adaptive HMM estimation using an online expectation-maximization algorithm, enabling real-time regime tracking for portfolio allocation. Their work demonstrated that regime-based strategies outperform static allocation, with Sharpe ratio improvements of 0.2--0.4 on multi-asset portfolios.
+
+A key limitation shared by all these methods is their reliance on raw returns or simple volatility estimates as inputs to the HMM. Our work is the first to combine self-supervised deep representation learning with HMMs for regime detection.
+
+\subsection{Deep Representation Learning for Time Series}
+
+\textbf{Temporal Convolutional Networks.} Bai et al.~\cite{bai2018} provided a comprehensive empirical evaluation showing that TCNs---using dilated causal convolutions with residual connections---achieve competitive or superior performance compared to LSTMs and GRUs across sequence modeling tasks, while offering stable gradient flow and parallelizable training. The key architectural insight is that exponentially increasing dilation factors ($d_l = 2^l$) create large receptive fields without proportional parameter growth.
+
+\textbf{Contrastive Learning.} Chen et al.~\cite{chen2020} introduced SimCLR, demonstrating that contrastive learning with augmented positive pairs and in-batch negatives learns visual representations that rival supervised features. Van den Oord et al.~\cite{oord2018} proposed Contrastive Predictive Coding (CPC) for sequential data, learning representations by predicting future observations in latent space.
+
+\textbf{Time Series Representation Learning.} Franceschi et al.~\cite{franceschi2019} applied triplet-loss-based representation learning to multivariate time series, showing that learned embeddings outperform hand-crafted features for classification. Yue et al.~\cite{yue2022} introduced TS2Vec with hierarchical contrastive objectives at multiple temporal scales, achieving state-of-the-art results across forecasting and classification benchmarks.
+
+In the financial domain, Zhang et al.~\cite{zhang2019} applied deep convolutional networks to limit order book data for price prediction. However, the application of contrastive representation learning specifically for regime detection remains unexplored, which our work addresses directly.
+
+\subsection{Regime-Conditional Portfolio Optimization}
+
+Markowitz~\cite{markowitz1952} established mean-variance optimization (MVO) as the foundational framework. While MVO is optimal under Gaussian assumptions, it produces concentrated, unintuitive portfolios when asset correlations change rapidly. L\'opez de Prado~\cite{lopez2016} introduced Hierarchical Risk Parity (HRP), which constructs a hierarchical tree of asset correlations and allocates inversely proportional to cluster variance, avoiding covariance matrix inversion entirely. Rockafellar and Uryasev~\cite{rockafellar2000} formulated Expected Shortfall (CVaR) minimization as a linear program, providing tail-risk management for defensive positioning.
+
+The key innovation of our portfolio component is the \textit{regime-conditional strategy multiplexer}: rather than using a single optimizer, we dynamically select the most appropriate optimization approach based on the detected regime, reflecting the observation that different market conditions favor different allocation philosophies.
+
+% === 3. PROPOSED METHOD ===
+\section{Proposed Method}
+\label{sec:method}
+
+\subsection{System Architecture}
+
+Fig.~\ref{fig:framework} presents the end-to-end RegimeEngine pipeline. Raw daily prices for $A$ assets are transformed into a $d$-dimensional feature matrix, which is segmented into overlapping 21-day windows and fed to the contrastive TCN encoder. The resulting 8D latent embeddings are normalized and processed by a multi-restart Gaussian HMM that outputs discrete regime labels. These labels drive a strategy multiplexer for portfolio allocation.
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+    node distance=1.4cm and 0.8cm,
+    block/.style={rectangle, draw, rounded corners=3pt, minimum width=2.4cm, minimum height=1.6cm, align=center, font=\footnotesize\bfseries, fill=#1!10, draw=#1!50, text=#1!80!black},
+    smallblock/.style={rectangle, draw, rounded corners=2pt, minimum width=1.8cm, minimum height=0.7cm, align=center, font=\tiny, fill=#1!8, draw=#1!40},
+    arrow/.style={-{Stealth[length=5pt]}, thick, color=gray!60},
+    darrow/.style={-{Stealth[length=5pt]}, thick, dashed, color=gray!40},
+    lbl/.style={font=\tiny\itshape, text=gray!70}
+]
+\node[block=blue]    (data)  {Stage 1\\Data Ingestion\\{\tiny yfinance API}\\{\tiny SPY, TLT, GLD}};
+\node[block=teal, right=of data]   (feat)  {Stage 2\\Feature\\Engineering};
+\node[block=violet, right=of feat] (tcn)   {Stage 3\\Contrastive\\TCN Encoder};
+\node[block=orange, right=of tcn]  (hmm)   {Stage 4\\Gaussian HMM\\{\tiny 4 states, 10 restarts}};
+\node[block=red, right=of hmm]     (port)  {Stage 5\\Portfolio\\Allocator};
+\node[block=green!60!black, right=of port] (back) {Stage 6\\Backtest \&\\Dashboard};
+
+% Feature sub-blocks
+\node[smallblock=teal, below=0.5cm of feat, xshift=-0.9cm] (f1) {\tiny Log Returns};
+\node[smallblock=teal, right=0.15cm of f1] (f2) {\tiny Volatility};
+\node[smallblock=teal, below=0.15cm of f1] (f3) {\tiny CUSUM};
+\node[smallblock=teal, right=0.15cm of f3] (f4) {\tiny Entropy};
+\node[smallblock=teal, below=0.15cm of f3, xshift=0.9cm] (f5) {\tiny Correlation};
+
+% Strategy sub-blocks
+\node[smallblock=red, below=0.5cm of port, xshift=-0.7cm] (s1) {\tiny MVO};
+\node[smallblock=red, right=0.1cm of s1] (s2) {\tiny Min-ES};
+\node[smallblock=red, below=0.15cm of s1] (s3) {\tiny HRP};
+\node[smallblock=red, right=0.1cm of s3] (s4) {\tiny EqWt};
+
+\draw[arrow] (data) -- (feat);
+\draw[arrow] (feat) -- node[above, lbl] {$\mathbf{x}_t \in \mathbb{R}^d$} (tcn);
+\draw[arrow] (tcn)  -- node[above, lbl] {$\mathbf{z}_t \in \mathbb{R}^8$} (hmm);
+\draw[arrow] (hmm)  -- node[above, lbl] {$s_t \in \{1..4\}$} (port);
+\draw[arrow] (port) -- node[above, lbl] {$\mathbf{w}_t$} (back);
+\draw[darrow] (feat) -- (f1); \draw[darrow] (feat) -- (f2);
+\draw[darrow] (port) -- (s1); \draw[darrow] (port) -- (s2);
+\end{tikzpicture}}
+\caption{RegimeEngine end-to-end architecture. Six stages process raw prices into regime-conditional portfolio weights. The TCN encoder (Stage~3) learns latent representations $\mathbf{z}_t$ via contrastive self-supervision; the Gaussian HMM (Stage~4) discovers four regimes from the latent space.}
+\label{fig:framework}
+\end{figure*}
+
+\subsection{Data Ingestion}
+\label{sec:data}
+
+We retrieve daily adjusted close prices for a configurable set of ETFs via the \texttt{yfinance} API. The default universe consists of SPY (S\&P 500 equity exposure), TLT (20+ year US Treasury bonds), and GLD (gold), providing equities, fixed income, and commodity diversification across macroeconomic regimes. The data spans January 2015 to December 2024, yielding approximately 2,500 trading days. Missing values due to holidays are forward-filled, and assets with fewer than 252 observations are rejected.
+
+\subsection{Feature Engineering}
+\label{sec:features}
+
+For each asset $a \in \{1, \ldots, A\}$ with price series $\{P_t^{(a)}\}$, we compute:
+
+\subsubsection{Log Returns}
+\begin{equation}
+    r_t^{(a)} = \ln\!\left(\frac{P_t^{(a)}}{P_{t-1}^{(a)}}\right)
+\label{eq:logret}
+\end{equation}
+
+Log returns are preferred over simple returns for their additive property over time and approximate normality.
+
+\subsubsection{Realized Volatility}
+The annualized rolling volatility over a $W$-day window:
+\begin{equation}
+    \sigma_t^{(a)} = \sqrt{252} \cdot \text{std}\!\left(\{r_{t-W+1}^{(a)}, \ldots, r_t^{(a)}\}\right), \; W\!=\!21
+\label{eq:vol}
+\end{equation}
+
+This captures the time-varying risk level and is a primary regime discriminator---crisis periods exhibit $\sigma > 30\%$ annualized while risk-on periods typically show $\sigma < 12\%$.
+
+\subsubsection{CUSUM Structural Break Statistics}
+The Page~\cite{page1954} CUSUM filter detects sustained directional drift:
+\begin{align}
+    S_t^{+} &= \max\!\left(0,\; S_{t-1}^{+} + r_t^{(a)} - \delta\right) \label{eq:cusum_pos}\\
+    S_t^{-} &= \min\!\left(0,\; S_{t-1}^{-} + r_t^{(a)} + \delta\right) \label{eq:cusum_neg}
+\end{align}
+where $\delta = 0$ (no drift correction). Regime transitions often coincide with CUSUM threshold crossings, as sustained positive (negative) drift accumulates in $S_t^{+}$ ($S_t^{-}$) before mean-reverting.
+
+\subsubsection{Shannon Entropy}
+We compute the distributional complexity of returns over a 63-day rolling window using a $B$-bin histogram ($B=10$):
+\begin{equation}
+    H_t^{(a)} = -\sum_{b=1}^{B} p_b \ln p_b, \quad p_b = \frac{n_b}{\sum_{b'} n_{b'}}
+\label{eq:entropy}
+\end{equation}
+High entropy indicates uniform, directionless returns (transitional regime); low entropy indicates concentrated returns around a mode (trending risk-on or persistent crisis).
+
+\subsubsection{Cross-Asset Rolling Correlation}
+For each pair $(a, a')$ with $a < a'$:
+\begin{equation}
+    \rho_t^{(a,a')} = \text{Corr}_{63d}\!\left(r^{(a)}, r^{(a')}\right)
+\label{eq:corr}
+\end{equation}
+
+The correlation breakdown phenomenon---where $\rho^{(\text{SPY},\text{TLT})}$ drops sharply during equity sell-offs while $\rho^{(\text{SPY},\text{GLD})}$ spikes---is a critical regime indicator. The feature vector at each time step is $\mathbf{x}_t \in \mathbb{R}^d$, where $d$ depends on the number of assets (e.g., $d = 12$ for 3 assets).
+
+\subsection{TCN Encoder Architecture}
+\label{sec:tcn}
+
+\subsubsection{Input Representation}
+A sliding window $\mathbf{X}_t = [\mathbf{x}_{t-W+1}, \ldots, \mathbf{x}_t] \in \mathbb{R}^{d \times W}$ with $W = 21$ trading days is the input to the encoder.
+
+\subsubsection{Temporal Block}
+Each temporal block contains two dilated causal convolution layers with residual connections:
+\begin{align}
+    \mathbf{h}^{(1)} &= \text{ReLU}\!\left(\text{Chomp}\!\left(\text{Conv1D}(\mathbf{x}; k, d_l)\right)\right) \\
+    \mathbf{h}^{(2)} &= \text{ReLU}\!\left(\text{Chomp}\!\left(\text{Conv1D}(\mathbf{h}^{(1)}; k, d_l)\right)\right) \\
+    \mathbf{y} &= \text{ReLU}\!\left(\mathbf{h}^{(2)} + \text{Res}(\mathbf{x})\right)
+\end{align}
+where $k=2$ is the kernel size, $d_l = 2^l$ is the dilation at level $l$, Chomp removes future-leaking padding to maintain causality, and Res is a $1 \times 1$ convolution when channels change. Dropout ($p=0.2$) is applied after each ReLU.
+
+\subsubsection{Full Architecture}
+Three temporal blocks with channel progression $[16, 32, 64]$ yield a receptive field of $R = 2 \cdot \sum_{l=0}^{2} 2^l = 14$ time steps. The final time-step output $\mathbf{y}_T \in \mathbb{R}^{64}$ is projected to the latent space via a linear layer:
+\begin{equation}
+    \mathbf{z}_t = \mathbf{W}_{\text{proj}} \cdot \mathbf{y}_T + \mathbf{b}_{\text{proj}}, \quad \mathbf{z}_t \in \mathbb{R}^8
+\label{eq:projection}
+\end{equation}
+
+\subsubsection{Contrastive Self-Supervised Loss}
+Positive pairs $(\mathbf{z}_t^{(1)}, \mathbf{z}_t^{(2)})$ are embeddings of temporally adjacent windows (temporal coherence assumption: nearby windows likely belong to the same regime). Negative pairs are constructed by circular batch-rolling:
+\begin{equation}
+    \mathcal{L} = \frac{1}{N}\!\sum_{i=1}^{N}\!\left[\|\mathbf{z}_i^+ \!-\! \mathbf{z}_i^{+\prime}\|_2^2 + \max\!\left(0, m \!-\! \|\mathbf{z}_i^+ \!-\! \mathbf{z}_i^{-}\|_2\right)^{\!2}\right]
+\label{eq:loss}
+\end{equation}
+where $m=1.0$ is the margin. This encourages same-regime embeddings to cluster while pushing different-regime embeddings apart, without requiring regime labels.
+
+\subsection{Gaussian HMM Regime Detection}
+\label{sec:hmm}
+
+The latent sequence $\{\mathbf{z}_t\}_{t=1}^{T}$ is modeled as emissions from a $K$-state ($K\!=\!4$) discrete HMM:
+\begin{align}
+    s_t | s_{t-1} &\sim \text{Cat}(\mathbf{A}_{s_{t-1}, \cdot}) \label{eq:hmm_trans}\\
+    \mathbf{z}_t | s_t\!=\!k &\sim \mathcal{N}(\boldsymbol{\mu}_k, \text{diag}(\boldsymbol{\sigma}_k^2)) \label{eq:hmm_emit}
+\end{align}
+
+\subsubsection{Robust Estimation Protocol}
+To prevent degenerate solutions:
+\begin{enumerate}
+    \item \textbf{Normalization:} $\tilde{\mathbf{z}} = \text{StandardScaler}(\mathbf{z})$ ensures zero mean and unit variance per dimension.
+    \item \textbf{Multi-restart EM:} 10 random initializations with seeds $\{42, 43, \ldots, 51\}$; the model with maximum log-likelihood $\ell^* = \max_j \ell_j$ is retained.
+    \item \textbf{Diagonal covariance:} Reduces parameters from $\mathcal{O}(L^2)$ to $\mathcal{O}(L)$ per state, preventing overfitting.
+    \item \textbf{Covariance floor:} $\sigma_{k,l}^2 \geq 10^{-3}$ prevents singular emission distributions.
+\end{enumerate}
+
+\subsubsection{Semantic State Ordering}
+After Viterbi decoding, states are ordered by the realized volatility of the original returns within each state:
+\begin{equation}
+    \sigma_k^{\text{real}} = \text{std}\!\left(\{r_t : s_t = k\}\right), \quad k \in \{1,\ldots,K\}
+\end{equation}
+States are sorted in ascending $\sigma_k^{\text{real}}$ order and mapped to: Risk-On ($\sigma_1$), Defensive ($\sigma_2$), Transitional ($\sigma_3$), Crisis ($\sigma_4$).
+
+\subsection{Regime-Conditional Portfolio Allocation}
+\label{sec:portfolio}
+
+The strategy multiplexer selects the allocation method based on $s_t$:
+\begin{equation}
+    \mathbf{w}_t = \begin{cases}
+    \text{MVO}(\hat{\boldsymbol{\mu}}, \hat{\boldsymbol{\Sigma}})  & s_t = \text{Risk-On} \\
+    \text{Min-ES}(\mathbf{R}_{252}, \alpha\!=\!0.05)              & s_t = \text{Defensive} \\
+    \frac{1}{A}\mathbf{1}                                          & s_t = \text{Transitional} \\
+    \text{HRP}(\hat{\boldsymbol{\Sigma}})                          & s_t = \text{Crisis}
+    \end{cases}
+\label{eq:allocator}
+\end{equation}
+
+where $\hat{\boldsymbol{\mu}}$ and $\hat{\boldsymbol{\Sigma}}$ are trailing 63-day estimates and $\mathbf{R}_{252}$ is the 252-day return history. To avoid look-ahead bias, regime $s_{t-1}$ determines weights at time $t$.
+
+\textbf{MVO} (Risk-On): Maximizes $\mathbf{w}^T\boldsymbol{\mu} - \frac{\gamma}{2}\mathbf{w}^T\boldsymbol{\Sigma}\mathbf{w}$ with risk aversion $\gamma = 3.0$. Appropriate when correlations are stable and returns are positively trending.
+
+\textbf{Min-ES} (Defensive): Minimizes the Conditional Value-at-Risk at the 5\% level via linear programming on historical scenarios. Protects against tail risk during uncertain, mildly adverse conditions.
+
+\textbf{HRP} (Crisis): Constructs a hierarchical tree from asset correlations and allocates inversely proportional to cluster variance. Avoids covariance matrix inversion, which becomes numerically unstable during crises when correlations spike.
+
+\textbf{Equal Weight} (Transitional): $w_a = 1/A$. Used during regime uncertainty when no single strategy has a clear advantage.
+
+% Part 2 is input via \input{part2.tex}
+\input{part2}
+
+\end{document}
