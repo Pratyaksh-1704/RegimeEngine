@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, time as dtime
 from sklearn.decomposition import PCA
 import logging
+import keep_alive  # noqa: F401 — self-ping daemon for Render free-tier
 
 # ─────────────────────────────────────────────────
 # Page config
