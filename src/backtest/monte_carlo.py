@@ -83,6 +83,125 @@ class RegimeSwitchingMonteCarlo:
         cum_returns = np.cumprod(1 + port_returns, axis=1)
         return initial_value * cum_returns
 
+
+class GBMSimulator:
+    """
+    Geometric Brownian Motion simulator for advanced Monte Carlo analysis.
+    P(t+1) = P(t) * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
+    """
+
+    @staticmethod
+    def simulate_gbm(start_price: float, mu_daily: float, sigma_daily: float,
+                     n_steps: int = 30, n_paths: int = 1000,
+                     seed: int | None = None) -> np.ndarray:
+        """
+        Returns array of shape (n_paths, n_steps+1) including the start price.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        dt = 1.0
+        Z = np.random.standard_normal((n_paths, n_steps))
+        log_returns = (mu_daily - 0.5 * sigma_daily**2) * dt + sigma_daily * np.sqrt(dt) * Z
+        log_paths = np.cumsum(log_returns, axis=1)
+        log_paths = np.hstack([np.zeros((n_paths, 1)), log_paths])
+        return start_price * np.exp(log_paths)
+
+    @staticmethod
+    def fan_chart_stats(paths: np.ndarray) -> dict:
+        """Compute percentile paths for fan charts."""
+        return {
+            'p5':     np.percentile(paths, 5, axis=0),
+            'p25':    np.percentile(paths, 25, axis=0),
+            'median': np.percentile(paths, 50, axis=0),
+            'mean':   np.mean(paths, axis=0),
+            'p75':    np.percentile(paths, 75, axis=0),
+            'p95':    np.percentile(paths, 95, axis=0),
+        }
+
+    @staticmethod
+    def compute_probabilities(paths: np.ndarray, start_price: float) -> dict:
+        """Compute key probabilities from final prices."""
+        finals = paths[:, -1]
+        return {
+            'P(gain)':  float(np.mean(finals > start_price) * 100),
+            'P(loss)':  float(np.mean(finals < start_price) * 100),
+            'P(+2%)':   float(np.mean(finals > start_price * 1.02) * 100),
+            'P(+5%)':   float(np.mean(finals > start_price * 1.05) * 100),
+            'P(+10%)':  float(np.mean(finals > start_price * 1.10) * 100),
+            'P(-2%)':   float(np.mean(finals < start_price * 0.98) * 100),
+            'P(-5%)':   float(np.mean(finals < start_price * 0.95) * 100),
+            'P(-10%)':  float(np.mean(finals < start_price * 0.90) * 100),
+            'expected': float(np.mean(finals)),
+            'median':   float(np.median(finals)),
+        }
+
+    @staticmethod
+    def compute_risk_metrics(paths: np.ndarray, start_price: float,
+                             alpha: float = 0.05) -> dict:
+        """VaR and CVaR from simulated final prices."""
+        finals = paths[:, -1]
+        pnl = (finals - start_price) / start_price
+        var_threshold = np.percentile(pnl, alpha * 100)
+        cvar = np.mean(pnl[pnl <= var_threshold]) if np.any(pnl <= var_threshold) else var_threshold
+        return {
+            'VaR_95':  float(-var_threshold * 100),
+            'CVaR_95': float(-cvar * 100),
+            'VaR_price':  float(start_price * (1 + var_threshold)),
+            'CVaR_price': float(start_price * (1 + cvar)),
+        }
+
+    @staticmethod
+    def density_matrix(paths: np.ndarray, n_price_bins: int = 50) -> tuple:
+        """
+        Build a 2D density matrix for the heatmap.
+        Returns (density, price_edges, days).
+        """
+        n_steps = paths.shape[1]
+        p_min = np.percentile(paths, 1)
+        p_max = np.percentile(paths, 99)
+        price_edges = np.linspace(p_min, p_max, n_price_bins + 1)
+        price_mids = 0.5 * (price_edges[:-1] + price_edges[1:])
+        density = np.zeros((n_price_bins, n_steps))
+        for t in range(n_steps):
+            counts, _ = np.histogram(paths[:, t], bins=price_edges)
+            total = counts.sum()
+            density[:, t] = counts / total if total > 0 else counts
+        days = np.arange(n_steps)
+        return density, price_mids, days
+
+    @staticmethod
+    def sensitivity_grid(start_price: float,
+                         mu_base: float, sigma_base: float,
+                         n_steps: int = 30, n_paths: int = 2000) -> list:
+        """
+        Run a 3x3 grid of simulations varying sigma and mu.
+        Returns list of 9 dicts with keys: label, mu, sigma, stats, probs.
+        """
+        sigma_scenarios = [
+            ('Low σ',  sigma_base * 0.6),
+            ('Base σ', sigma_base),
+            ('High σ', sigma_base * 1.6),
+        ]
+        mu_scenarios = [
+            ('Bear μ',    mu_base - abs(mu_base) * 2),
+            ('Neutral μ', mu_base),
+            ('Bull μ',    mu_base + abs(mu_base) * 2),
+        ]
+        results = []
+        for s_name, sigma in sigma_scenarios:
+            for m_name, mu in mu_scenarios:
+                paths = GBMSimulator.simulate_gbm(
+                    start_price, mu, sigma, n_steps, n_paths)
+                stats = GBMSimulator.fan_chart_stats(paths)
+                probs = GBMSimulator.compute_probabilities(paths, start_price)
+                results.append({
+                    'label': f"{s_name} · {m_name}",
+                    'mu': mu, 'sigma': sigma,
+                    'stats': stats, 'probs': probs, 'paths': paths,
+                })
+        return results
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     p = np.array([[0.9, 0.1], [0.2, 0.8]])

@@ -11,7 +11,6 @@ from plotly.subplots import make_subplots
 from datetime import datetime, time as dtime
 from sklearn.decomposition import PCA
 import logging
-import keep_alive  # noqa: F401 — self-ping daemon for Render free-tier
 
 # ─────────────────────────────────────────────────
 # Page config
@@ -342,12 +341,17 @@ with st.sidebar:
     window    = st.slider("Lookback Window (d)", 5,  63, 21, 1)
 
     st.markdown("---")
+    st.markdown("**🎲 Monte Carlo Settings**")
+    mc_paths   = st.slider("MC Simulation Paths", 500, 10000, 2000, 500)
+    mc_horizon = st.slider("Forecast Horizon (d)", 5, 252, 30, 5)
+
+    st.markdown("---")
     run_btn = st.button("🚀 Run RegimeEngine")
 
 # ─────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────
-t_over, t_feat, t_tcn, t_hmm, t_port, t_adv, t_abl = st.tabs([
+t_over, t_feat, t_tcn, t_hmm, t_port, t_adv, t_abl, t_mc = st.tabs([
     "📊  Overview",
     "🧮  Features",
     "🧠  TCN Encoder",
@@ -355,6 +359,7 @@ t_over, t_feat, t_tcn, t_hmm, t_port, t_adv, t_abl = st.tabs([
     "💼  Portfolio",
     "🤖  Advisor",
     "🔬  Ablation Study",
+    "🎲  Monte Carlo",
 ])
 # ─────────────────────────────────────────────────
 # Welcome screen
@@ -1047,3 +1052,431 @@ data using five unsupervised quality metrics to isolate the contribution of the 
 """)
     else:
         st.info("▶  Run the pipeline first (🚀 Run RegimeEngine) to enable the ablation study.")
+
+# ════════════════════════════════════════
+# TAB 7 — MONTE CARLO SIMULATION
+# ════════════════════════════════════════
+with t_mc:
+    section("🎲  ADVANCED MONTE CARLO SIMULATION")
+    st.markdown("""
+<div style="background:#111C2D;border:1px solid rgba(59,130,246,0.10);border-radius:10px;
+            padding:18px 24px;margin-bottom:20px;font-size:12px;color:#7A9BB5;line-height:1.7">
+<strong style="color:#E2EAF4">Regime-Switching Monte Carlo Engine</strong> — Forward-looking simulation
+using the HMM's learned transition matrix and regime-specific return distributions.<br><br>
+<strong>GBM Formula:</strong>
+<code style="color:#A78BFA">P(t+1) = P(t) × exp((μ − 0.5σ²)·Δt + σ·√Δt·Z)</code>
+where Z ~ N(0,1)<br>
+Paths: <code>{mc_paths}</code> · Horizon: <code>{mc_horizon}d</code>
+</div>""".format(mc_paths=mc_paths, mc_horizon=mc_horizon), unsafe_allow_html=True)
+
+    _mc_ready = ('hmm_m' in dir() and hmm_m is not None
+                 and 'latent_z' in dir() and latent_z is not None
+                 and 'returns' in dir() and returns is not None
+                 and 'prices' in dir() and prices is not None)
+
+    if _mc_ready:
+        from src.backtest.monte_carlo import RegimeSwitchingMonteCarlo, GBMSimulator
+
+        # ── Derive params from pipeline data ──────────────────────────
+        first_tick   = prices.columns[0]
+        start_price  = float(prices[first_tick].iloc[-1])
+        eq_ret       = returns.mean(axis=1)
+        mu_daily     = float(eq_ret.mean())
+        sigma_daily  = float(eq_ret.std())
+
+        # Current regime and transition matrix
+        cur_regime_name = regimes.iloc[-1]
+        transmat        = hmm_m.get_transition_matrix()
+        pred_states     = hmm_m.predict(latent_z)
+        n_states        = hmm_m.n_components
+
+        # Build per-regime mu/cov from observed returns
+        regime_params = {}
+        for s in range(n_states):
+            mask = pred_states == s
+            rets_in_s = returns.values[mask] if mask.any() else returns.values[:10]
+            regime_params[s] = {
+                'mu':  rets_in_s.mean(axis=0),
+                'cov': np.cov(rets_in_s.T) + np.eye(rets_in_s.shape[1]) * 1e-6,
+            }
+
+        # Find integer state for current regime
+        cur_state = 0
+        for s, name in hmm_m.state_map.items():
+            if name == cur_regime_name:
+                cur_state = s
+                break
+
+        with st.spinner("⚡ Running Monte Carlo simulations…"):
+            # ── 1) Regime-Switching MC ─────────────────────────────────
+            mc_engine = RegimeSwitchingMonteCarlo(transmat, regime_params)
+            mc_res    = mc_engine.simulate(cur_state, mc_horizon, n_paths=mc_paths)
+
+            # Equal-weight portfolio paths
+            n_assets   = mc_res['returns'].shape[2]
+            eq_weights = np.ones(n_assets) / n_assets
+            port_paths = mc_engine.simulate_portfolio_paths(
+                mc_res['returns'], eq_weights, initial_value=start_price)
+
+            # ── 2) Standard GBM for comparison ────────────────────────
+            gbm_paths = GBMSimulator.simulate_gbm(
+                start_price, mu_daily, sigma_daily,
+                mc_horizon, mc_paths, seed=42)
+
+        # ══════════════════════════════════════════
+        # SECTION 1 — REGIME-SWITCHING FAN CHART
+        # ══════════════════════════════════════════
+        section("📈  REGIME-SWITCHING FORWARD SIMULATION")
+        rs_stats = GBMSimulator.fan_chart_stats(port_paths)
+        rs_probs = GBMSimulator.compute_probabilities(port_paths, start_price)
+        rs_risk  = GBMSimulator.compute_risk_metrics(port_paths, start_price)
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Expected Price", f"${rs_probs['expected']:,.2f}",
+                   delta=f"{(rs_probs['expected']/start_price - 1)*100:+.2f}%")
+        mc2.metric("P(Gain)",        f"{rs_probs['P(gain)']:.1f}%")
+        mc3.metric("VaR 95%",        f"{rs_risk['VaR_95']:.2f}%")
+        mc4.metric("CVaR 95%",       f"{rs_risk['CVaR_95']:.2f}%")
+
+        days_x = list(range(mc_horizon))
+        fig_fan = go.Figure()
+        # P5-P95 band
+        fig_fan.add_trace(go.Scatter(
+            x=days_x + days_x[::-1],
+            y=list(rs_stats['p95']) + list(rs_stats['p5'][::-1]),
+            fill='toself', fillcolor='rgba(59,130,246,0.08)',
+            line=dict(width=0), name='P5–P95 Band', showlegend=True))
+        # P25-P75 band
+        fig_fan.add_trace(go.Scatter(
+            x=days_x + days_x[::-1],
+            y=list(rs_stats['p75']) + list(rs_stats['p25'][::-1]),
+            fill='toself', fillcolor='rgba(59,130,246,0.18)',
+            line=dict(width=0), name='P25–P75 Band', showlegend=True))
+        # Median & mean
+        fig_fan.add_trace(go.Scatter(
+            x=days_x, y=rs_stats['median'], mode='lines',
+            name='Median', line=dict(color='#00D4FF', width=3)))
+        fig_fan.add_trace(go.Scatter(
+            x=days_x, y=rs_stats['mean'], mode='lines',
+            name='Mean', line=dict(color='#A78BFA', width=2, dash='dot')))
+        # P5 and P95 lines
+        fig_fan.add_trace(go.Scatter(
+            x=days_x, y=rs_stats['p5'], mode='lines',
+            name='P5', line=dict(color='#E84040', width=1.5, dash='dash')))
+        fig_fan.add_trace(go.Scatter(
+            x=days_x, y=rs_stats['p95'], mode='lines',
+            name='P95', line=dict(color='#22C993', width=1.5, dash='dash')))
+        # Current price line
+        fig_fan.add_hline(y=start_price,
+            line=dict(color='rgba(255,255,255,0.4)', dash='dot', width=1),
+            annotation_text=f'Current: ${start_price:,.0f}',
+            annotation_font=dict(color='#E2EAF4', size=10))
+        pct_chart(fig_fan, height=420,
+                  xaxis=dict(title='Trading Day', gridcolor='rgba(59,130,246,0.08)'),
+                  yaxis=dict(title='Price ($)', gridcolor='rgba(59,130,246,0.08)'))
+
+        # ══════════════════════════════════════════
+        # SECTION 2 — 3D MONTE CARLO TORNADO
+        # ══════════════════════════════════════════
+        section("🌪  3D MONTE CARLO PATH TORNADO")
+        st.caption("Drag to rotate · Scroll to zoom · Green = gain, Red = loss")
+
+        n_sample = min(300, mc_paths)
+        sample_idx = np.random.choice(mc_paths, n_sample, replace=False)
+        fig_3d = go.Figure()
+
+        for si, idx in enumerate(sample_idx):
+            path = gbm_paths[idx]
+            final_gain = path[-1] > start_price
+            color = 'rgba(34,201,147,0.07)' if final_gain else 'rgba(232,64,64,0.07)'
+            fig_3d.add_trace(go.Scatter3d(
+                x=list(range(len(path))), y=[si]*len(path), z=path.tolist(),
+                mode='lines', line=dict(color=color, width=1),
+                showlegend=False, hoverinfo='skip'))
+
+        # Mean path overlay
+        gbm_stats = GBMSimulator.fan_chart_stats(gbm_paths)
+        mid_y = n_sample // 2
+        fig_3d.add_trace(go.Scatter3d(
+            x=list(range(len(gbm_stats['mean']))),
+            y=[mid_y]*len(gbm_stats['mean']),
+            z=gbm_stats['mean'].tolist(),
+            mode='lines', line=dict(color='#00D4FF', width=6),
+            name='Mean Path'))
+        # P5 path
+        fig_3d.add_trace(go.Scatter3d(
+            x=list(range(len(gbm_stats['p5']))),
+            y=[10]*len(gbm_stats['p5']),
+            z=gbm_stats['p5'].tolist(),
+            mode='lines', line=dict(color='#E84040', width=3, dash='dash'),
+            name='P5'))
+        # P95 path
+        fig_3d.add_trace(go.Scatter3d(
+            x=list(range(len(gbm_stats['p95']))),
+            y=[n_sample - 10]*len(gbm_stats['p95']),
+            z=gbm_stats['p95'].tolist(),
+            mode='lines', line=dict(color='#22C993', width=3, dash='dash'),
+            name='P95'))
+
+        fig_3d.update_layout(
+            height=560, template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            scene=dict(
+                bgcolor='#030610',
+                xaxis=dict(title='Trading Day', gridcolor='rgba(59,130,246,0.12)',
+                           color='#3D5A73'),
+                yaxis=dict(title='Simulation #', gridcolor='rgba(59,130,246,0.12)',
+                           color='#3D5A73'),
+                zaxis=dict(title='Price ($)', gridcolor='rgba(59,130,246,0.12)',
+                           color='#7A9BB5'),
+                camera=dict(eye=dict(x=1.8, y=1.2, z=0.9)),
+            ),
+            font=dict(color='#7A9BB5', size=10),
+            margin=dict(l=0, r=0, t=20, b=0),
+        )
+        st.plotly_chart(fig_3d, use_container_width=True)
+
+        # ══════════════════════════════════════════
+        # SECTION 3 — 2D DENSITY HEATMAP
+        # ══════════════════════════════════════════
+        section("🔥  PRICE-TIME DENSITY HEATMAP")
+
+        density, price_mids, days_arr = GBMSimulator.density_matrix(gbm_paths, n_price_bins=50)
+
+        fig_hm = go.Figure()
+        fig_hm.add_trace(go.Heatmap(
+            z=density, x=days_arr, y=price_mids,
+            colorscale=[
+                [0, '#030610'], [0.2, '#003060'], [0.5, '#006090'],
+                [0.75, '#00C0D0'], [0.9, '#00FF88'], [1.0, '#FFFF00']],
+            showscale=True, colorbar=dict(
+                title='Density', titlefont=dict(color='#7A9BB5', size=10),
+                tickfont=dict(color='#7A9BB5', size=9)),
+            hovertemplate='Day %{x}<br>Price $%{y:,.0f}<br>Density %{z:.4f}<extra></extra>'))
+        # Overlay mean path
+        fig_hm.add_trace(go.Scatter(
+            x=days_arr, y=gbm_stats['mean'][:-1] if len(gbm_stats['mean']) > len(days_arr) else gbm_stats['mean'][:len(days_arr)],
+            mode='lines', name='Mean',
+            line=dict(color='#00D4FF', width=2.5)))
+        fig_hm.add_trace(go.Scatter(
+            x=days_arr, y=gbm_stats['p5'][:-1] if len(gbm_stats['p5']) > len(days_arr) else gbm_stats['p5'][:len(days_arr)],
+            mode='lines', name='P5',
+            line=dict(color='#E84040', width=1.5, dash='dash')))
+        fig_hm.add_trace(go.Scatter(
+            x=days_arr, y=gbm_stats['p95'][:-1] if len(gbm_stats['p95']) > len(days_arr) else gbm_stats['p95'][:len(days_arr)],
+            mode='lines', name='P95',
+            line=dict(color='#22C993', width=1.5, dash='dash')))
+        fig_hm.add_hline(y=start_price,
+            line=dict(color='rgba(255,255,255,0.5)', dash='dot', width=1))
+        pct_chart(fig_hm, height=420,
+                  xaxis=dict(title='Trading Day', gridcolor='rgba(59,130,246,0.08)'),
+                  yaxis=dict(title='Price ($)', gridcolor='rgba(59,130,246,0.08)'))
+
+        # ══════════════════════════════════════════
+        # SECTION 4 — PROBABILITY DASHBOARD
+        # ══════════════════════════════════════════
+        section("📊  PROBABILITY DASHBOARD")
+
+        gbm_probs = GBMSimulator.compute_probabilities(gbm_paths, start_price)
+        gbm_risk  = GBMSimulator.compute_risk_metrics(gbm_paths, start_price)
+
+        # Bullish probabilities
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1.markdown(f"""
+<div style="background:rgba(34,201,147,0.08);border:1px solid #22C993;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(Gain)</div>
+  <div style="font-size:28px;font-weight:800;color:#22C993;font-family:'JetBrains Mono'">{gbm_probs['P(gain)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        bc2.markdown(f"""
+<div style="background:rgba(34,201,147,0.08);border:1px solid #22C993;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(+2%)</div>
+  <div style="font-size:28px;font-weight:800;color:#22C993;font-family:'JetBrains Mono'">{gbm_probs['P(+2%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        bc3.markdown(f"""
+<div style="background:rgba(34,201,147,0.08);border:1px solid #22C993;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(+5%)</div>
+  <div style="font-size:28px;font-weight:800;color:#22C993;font-family:'JetBrains Mono'">{gbm_probs['P(+5%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        bc4.markdown(f"""
+<div style="background:rgba(34,201,147,0.08);border:1px solid #22C993;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(+10%)</div>
+  <div style="font-size:28px;font-weight:800;color:#22C993;font-family:'JetBrains Mono'">{gbm_probs['P(+10%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+
+        # Bearish probabilities
+        br1, br2, br3, br4 = st.columns(4)
+        br1.markdown(f"""
+<div style="background:rgba(232,64,64,0.08);border:1px solid #E84040;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(Loss)</div>
+  <div style="font-size:28px;font-weight:800;color:#E84040;font-family:'JetBrains Mono'">{gbm_probs['P(loss)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        br2.markdown(f"""
+<div style="background:rgba(232,64,64,0.08);border:1px solid #E84040;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(−2%)</div>
+  <div style="font-size:28px;font-weight:800;color:#E84040;font-family:'JetBrains Mono'">{gbm_probs['P(-2%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        br3.markdown(f"""
+<div style="background:rgba(232,64,64,0.08);border:1px solid #E84040;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(−5%)</div>
+  <div style="font-size:28px;font-weight:800;color:#E84040;font-family:'JetBrains Mono'">{gbm_probs['P(-5%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+        br4.markdown(f"""
+<div style="background:rgba(232,64,64,0.08);border:1px solid #E84040;border-radius:10px;padding:16px;text-align:center">
+  <div style="font-size:10px;color:#3D5A73;text-transform:uppercase;letter-spacing:1.5px">P(−10%)</div>
+  <div style="font-size:28px;font-weight:800;color:#E84040;font-family:'JetBrains Mono'">{gbm_probs['P(-10%)']:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Risk metrics
+        rk1, rk2, rk3, rk4 = st.columns(4)
+        rk1.metric("VaR 95% (GBM)", f"{gbm_risk['VaR_95']:.2f}%")
+        rk2.metric("CVaR 95% (GBM)", f"{gbm_risk['CVaR_95']:.2f}%")
+        rk3.metric("VaR Price", f"${gbm_risk['VaR_price']:,.2f}")
+        rk4.metric("CVaR Price", f"${gbm_risk['CVaR_price']:,.2f}")
+
+        # Comparison table
+        st.markdown("<br>", unsafe_allow_html=True)
+        section("⚖  GBM vs REGIME-SWITCHING COMPARISON")
+        comp_df = pd.DataFrame({
+            'Metric': ['Expected Price', 'Median Price', 'P(Gain)', 'VaR 95%', 'CVaR 95%',
+                       'P(+5%)', 'P(−5%)'],
+            'GBM Model': [
+                f"${gbm_probs['expected']:,.2f}",
+                f"${gbm_probs['median']:,.2f}",
+                f"{gbm_probs['P(gain)']:.1f}%",
+                f"{gbm_risk['VaR_95']:.2f}%",
+                f"{gbm_risk['CVaR_95']:.2f}%",
+                f"{gbm_probs['P(+5%)']:.1f}%",
+                f"{gbm_probs['P(-5%)']:.1f}%",
+            ],
+            'Regime-Switching': [
+                f"${rs_probs['expected']:,.2f}",
+                f"${rs_probs['median']:,.2f}",
+                f"{rs_probs['P(gain)']:.1f}%",
+                f"{rs_risk['VaR_95']:.2f}%",
+                f"{rs_risk['CVaR_95']:.2f}%",
+                f"{rs_probs['P(+5%)']:.1f}%",
+                f"{rs_probs['P(-5%)']:.1f}%",
+            ],
+        })
+        st.dataframe(comp_df, use_container_width=True, hide_index=True, height=290)
+
+        # ══════════════════════════════════════════
+        # SECTION 5 — SENSITIVITY GRID
+        # ══════════════════════════════════════════
+        section("🎛  PARAMETER SENSITIVITY GRID (3×3)")
+        st.caption("Varying σ (volatility) and μ (drift) around historical estimates")
+
+        with st.spinner("Computing 9 sensitivity scenarios…"):
+            grid = GBMSimulator.sensitivity_grid(
+                start_price, mu_daily, sigma_daily,
+                n_steps=mc_horizon, n_paths=min(mc_paths, 2000))
+
+        # 3x3 grid of mini fan charts
+        for row_i in range(3):
+            cols_g = st.columns(3)
+            for col_i in range(3):
+                gi = row_i * 3 + col_i
+                g = grid[gi]
+                with cols_g[col_i]:
+                    is_base = (row_i == 1 and col_i == 1)
+                    border_col = '#00D4FF' if is_base else 'rgba(59,130,246,0.15)'
+                    pg = g['probs']['P(gain)']
+                    pg_col = '#22C993' if pg > 55 else ('#E84040' if pg < 45 else '#E8A838')
+                    st.markdown(f"""
+<div style="background:#111C2D;border:1px solid {border_col};
+            border-radius:8px;padding:12px 14px;margin-bottom:6px">
+  <div style="font-size:10px;font-weight:700;color:{'#00D4FF' if is_base else '#7A9BB5'};
+              text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">
+    {'★ ' if is_base else ''}{g['label']}
+  </div>
+  <div style="font-family:'JetBrains Mono';font-size:13px;color:#E2EAF4">
+    E[P] = ${g['probs']['expected']:,.0f}
+    <span style="color:{pg_col};margin-left:8px">P(gain)={pg:.0f}%</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                    s = g['stats']
+                    days_s = list(range(len(s['median'])))
+                    fig_s = go.Figure()
+                    fig_s.add_trace(go.Scatter(
+                        x=days_s + days_s[::-1],
+                        y=list(s['p95']) + list(s['p5'][::-1]),
+                        fill='toself', fillcolor='rgba(59,130,246,0.10)',
+                        line=dict(width=0), showlegend=False))
+                    fig_s.add_trace(go.Scatter(
+                        x=days_s, y=s['median'], mode='lines',
+                        line=dict(color='#00D4FF', width=2), showlegend=False))
+                    fig_s.add_hline(y=start_price,
+                        line=dict(color='rgba(255,255,255,0.2)', dash='dot', width=1))
+                    fig_s.update_layout(
+                        height=180, template='plotly_dark',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(17,28,45,1)',
+                        font=dict(color='#7A9BB5', size=9),
+                        margin=dict(l=40, r=10, t=8, b=30),
+                        xaxis=dict(gridcolor='rgba(59,130,246,0.06)', zeroline=False,
+                                   showticklabels=True, tickfont=dict(size=8)),
+                        yaxis=dict(gridcolor='rgba(59,130,246,0.06)', zeroline=False,
+                                   tickfont=dict(size=8)),
+                    )
+                    st.plotly_chart(fig_s, use_container_width=True)
+
+        # Sensitivity summary table
+        section("📋  SENSITIVITY SUMMARY TABLE")
+        sens_rows = []
+        for g in grid:
+            sens_rows.append({
+                'Scenario': g['label'],
+                'σ daily': f"{g['sigma']*100:.3f}%",
+                'μ daily': f"{g['mu']*100:.4f}%",
+                'E[Price]': f"${g['probs']['expected']:,.2f}",
+                'Median': f"${g['probs']['median']:,.2f}",
+                'P(Gain)': f"{g['probs']['P(gain)']:.1f}%",
+                'P(+5%)': f"{g['probs']['P(+5%)']:.1f}%",
+                'P(−5%)': f"{g['probs']['P(-5%)']:.1f}%",
+            })
+        st.dataframe(pd.DataFrame(sens_rows), use_container_width=True,
+                     hide_index=True, height=370)
+
+        # Final distribution histogram
+        section("📊  FINAL PRICE DISTRIBUTION")
+        finals = gbm_paths[:, -1]
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=finals, nbinsx=60,
+            marker_color='#3B82F6', opacity=0.75, name='Final Prices'))
+        fig_hist.add_vline(x=start_price,
+            line=dict(color='rgba(255,255,255,0.6)', dash='dash', width=2),
+            annotation_text=f'Current: ${start_price:,.0f}',
+            annotation_font=dict(color='#E2EAF4', size=10))
+        fig_hist.add_vline(x=gbm_probs['expected'],
+            line=dict(color='#00D4FF', dash='solid', width=2),
+            annotation_text=f'Expected: ${gbm_probs["expected"]:,.0f}',
+            annotation_font=dict(color='#00D4FF', size=10))
+        fig_hist.add_vline(x=np.percentile(finals, 5),
+            line=dict(color='#E84040', dash='dot', width=1.5),
+            annotation_text='P5', annotation_font=dict(color='#E84040', size=9))
+        fig_hist.add_vline(x=np.percentile(finals, 95),
+            line=dict(color='#22C993', dash='dot', width=1.5),
+            annotation_text='P95', annotation_font=dict(color='#22C993', size=9))
+        pct_chart(fig_hist, height=320,
+                  xaxis=dict(title='Final Price ($)', gridcolor='rgba(59,130,246,0.08)'),
+                  yaxis=dict(title='Count', gridcolor='rgba(59,130,246,0.08)'))
+
+        # Formula reference expander
+        with st.expander("ℹ️  Monte Carlo Formula Reference (click to expand)"):
+            st.markdown("""
+| Formula | Expression |
+|---|---|
+| **GBM Daily Step** | `P(t+1) = P(t) × exp((μ − 0.5σ²)·Δt + σ·√Δt·Z)` |
+| **Log Return** | `r_t = ln(P_t / P_{t-1})` |
+| **Daily μ from annual** | `μ_daily = μ_annual / 252` |
+| **Daily σ from annual** | `σ_daily = σ_annual / √252` |
+| **VaR 95%** | `−Percentile(PnL, 5%)` |
+| **CVaR 95%** | `−Mean(PnL where PnL ≤ VaR)` |
+| **Regime-Switching** | Draw regime from transition matrix A, then draw returns from N(μ_k, Σ_k) |
+""")
+    else:
+        st.info("▶  Run the pipeline first (🚀 Run RegimeEngine) to enable Monte Carlo simulations.")
