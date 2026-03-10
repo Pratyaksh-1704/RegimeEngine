@@ -1250,7 +1250,7 @@ Paths: <code>{mc_paths}</code> · Horizon: <code>{mc_horizon}d</code>
                 [0, '#030610'], [0.2, '#003060'], [0.5, '#006090'],
                 [0.75, '#00C0D0'], [0.9, '#00FF88'], [1.0, '#FFFF00']],
             showscale=True, colorbar=dict(
-                title='Density', titlefont=dict(color='#7A9BB5', size=10),
+                title=dict(text='Density', font=dict(color='#7A9BB5', size=10)),
                 tickfont=dict(color='#7A9BB5', size=9)),
             hovertemplate='Day %{x}<br>Price $%{y:,.0f}<br>Density %{z:.4f}<extra></extra>'))
         # Overlay mean path
